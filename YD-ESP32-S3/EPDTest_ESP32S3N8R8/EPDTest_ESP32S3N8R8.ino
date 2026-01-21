@@ -6,12 +6,16 @@
   Written by Limor Fried/Ladyada for Adafruit Industries.
   MIT license, all text above must be included in any redistribution
  ****************************************************/
- //V1.12 added WiFi get Quote test function, test works!
- //V1.11 added some fonts, opt for display
+ //V1.15 added and improved EPD detection function, OPT of GUI display of time and date
+//V1.14 added NTP get time, need test, seems working!
+//V1.13 added timeupdate function, fixed time show bug
+//found bug: Serial.printf(">>: %u hour,%lu s! %u s\r\n" always show 0, seems related to uint64_t
+//V1.12 added WiFi get Quote test function, test works! peak current 148mA
+//V1.11 added some fonts, opt for display
 //V1.10 fixed  EPD seconds show bug, 17.Jan.2026
 //V1.09 trying to to add debug info for EPD seconds show bug,
 //V1.08 fixed EPD seconds show bug, failed
-//V1.07 opt of sleep, turn off LED during sleep, Active run 45mA, sleep <4mA
+//V1.07 opt of sleep, turn off LED during sleep, Active run 45mA, sleep <8mA
 //V1.06 added light sleep to save power, test works!
 //V1.05 added CO2 history data and average data show
 //V1.04 added EPD CO2 display, added Min Max display
@@ -22,8 +26,8 @@
 
 //use debug port for uploading FW!
 #include "Adafruit_EPD.h"
-#include <Fonts/FreeMonoBold9pt7b.h> //has a height of about 18 pixels,
-#include <Fonts/FreeMono9pt7b.h> 
+#include <Fonts/FreeMonoBold9pt7b.h>  //has a height of about 18 pixels,
+#include <Fonts/FreeMono9pt7b.h>
 //#include <Fonts/FreeMono9pt7b.h> //
 //#include <Fonts/FreeSans12pt7b.h> //
 #include <Fonts/FreeSans9pt7b.h>
@@ -36,6 +40,7 @@
 
 #include <WiFi.h>
 #include "time.h"
+//#include <TimeLib.h>
 #include "esp_sntp.h"
 
 #include <Wire.h>
@@ -45,26 +50,29 @@
 
 #include "Net_config.h"
 
-SCD4x SCD40Sensor;                           //The default I2C address for the SCD4x is 0x62.
-#define ESP32_sleep_interval 5000            //in ms 5s
+
+SCD4x SCD40Sensor;                 //The default I2C address for the SCD4x is 0x62.
+#define ESP32_sleep_interval 5000  //in ms 5s
 //versions
 #define Version_Nrd '1'
 #define Version_Nrf1 '1'  //2._x
-#define Version_Nrf2 '2'  //2.x_
+#define Version_Nrf2 '3'  //2.x_
 
 #define Init_test_EPD_EN 0
 #define SCD40Sensor_EN 1
 #define Loop_perodic_update_EN 1
 #define Loop_WiFi_perodic_update_EN 1
-#define  WiFi_refresh_interval 5
-uint16_t  WiFi_refresh_interval_tmp = WiFi_refresh_interval ;
+#define WiFi_refresh_interval 5
+uint16_t WiFi_refresh_interval_tmp = WiFi_refresh_interval;
 
-#define EPD_refresh_interval 15 //30
-uint64_t sleepTime = ESP32_sleep_interval * 1000;  // Sleep duration in microseconds (1 seconds)
-uint64_t sys_on_time_second = 0;
+#define EPD_refresh_interval 15                    //30
+uint32_t sleepTime = ESP32_sleep_interval * 1000;  // Sleep duration in microseconds (1 seconds)
+uint32_t sys_on_time_second = 0;
 uint32_t sys_on_time_hour = 0;
-uint64_t sys_on_time_second_tmp = 0;
-uint64_t sleepTime_seconds = ESP32_sleep_interval / 1000;
+uint32_t sys_on_time_second_tmp = 0;
+uint32_t sleepTime_seconds = ESP32_sleep_interval / 1000;
+#define EPD_display_refresh_time 22  //22s
+uint32_t EPD_display_refresh_cnt = 0;
 
 #undef ARDUINO_ADAFRUIT_FEATHER_RP2040_THINKINK
 #ifdef ARDUINO_ADAFRUIT_FEATHER_RP2040_THINKINK  // detects if compiling for \
@@ -84,6 +92,8 @@ uint64_t sleepTime_seconds = ESP32_sleep_interval / 1000;
 #define EPD_SPI &SPI  // primary SPI, HSPI? #include <SPI.h>?
 #endif
 #define SPI_CS 10  //Low wirh SCK, OK! Use this pin for EPD CS1
+
+#include "EPD_detect.h"
 //SPI MOSI 11  seems has missing waveforms!
 //MISO 13
 //SCK 12
@@ -103,6 +113,8 @@ uint8_t color_change_idx = 0;
 
 #define EPD_width 250
 #define EPD_height 122
+#define EPD_Driver_IC "SSD1680"
+#define EPD_Driver_IC2 "SSD1675"
 //#define EPD_height 104
 
 //https://docs.arduino.cc/libraries/adafruit-epd/
@@ -113,22 +125,24 @@ uint8_t color_change_idx = 0;
 // Adafruit_SSD1680 display(152, 152, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS,
 
 
-//Uncomment the following line if you are using 2.13" EPD with SSD1680
+//Uncomment the following line if you are using 2.13" EPD with SSD1680, HINK 2.13 seems not very fit,Top bar crashed pixels
 Adafruit_SSD1680 display(EPD_width, EPD_height, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
 //Adafruit_SSD1680 display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SPI_CS, EPD_BUSY, EPD_SPI); //tested partialy working
+//SSD1680：较新的驱动芯片，支持更高的分辨率和更多的功能。例如，我们使用的2.13英寸三色屏（250x122）就是使用SSD1680驱动。它支持局部刷新和更灵活的波形控制。
 
-// Uncomment the following line if you are using 2.13" EPD with SSD1675
-//Adafruit_SSD1675 display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS,EPD_BUSY, EPD_SPI); //not working!
+// Uncomment the following line if you are using 2.13" EPD with SSD1675,HINK 2.13 seems resolution fit,Top bar no issue but no RED color
+//Adafruit_SSD1675 display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS,EPD_BUSY, EPD_SPI); //not working for TElink0213 A002!
 //Adafruit_SSD1675 display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SPI_CS,EPD_BUSY, EPD_SPI); //not working!
 
 
-// Uncomment the following line if you are using 2.13" EPD with SSD1675B
-//Adafruit_SSD1675B display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);//not working!
+// Uncomment the following line if you are using 2.13" EPD with SSD1675B, not fit HINK 2.13 , random pixels!
+//Adafruit_SSD1675B display(250, 122, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);//not working!not working for TElink0213 A002!
+//SSD1675B：SSD1675的改进版本，可能有一些优化，比如降低功耗、简化初始化序列等。同样支持三色（黑白红）和双色（黑白）显示。
 
-// Uncomment the following line if you are using 2.13" EPD with UC8151D
+// Uncomment the following line if you are using 2.13" EPD with UC8151D, not fit HINK 2.13 
 //Adafruit_UC8151D display(212, 104, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);//not working!
 
-// Uncomment the following line if you are using 2.13" EPD with IL0373
+// Uncomment the following line if you are using 2.13" EPD with IL0373， not fit  HINK 2.13 
 //Adafruit_IL0373 display(212, 104, EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
 //#define FLEXIBLE_213
 
@@ -176,7 +190,9 @@ void show_SPI_pins(void);
 uint32_t sys_cnt = 0;
 char version_buf[4];
 uint16_t wifi_sucess_cnt = 0;
-char quote_text[100]; 
+char quote_text[100];
+char timeDisplayStr[30];
+extern struct tm  timeinfo;
 
 void setup() {
   Serial.begin(115200);
@@ -189,10 +205,13 @@ void setup() {
   // while (!Serial) { delay(10); }
   //Serial.println("\r\n<Adafruit 2.13 BW+R EPD SCD40 sensor test V1.08B by Zell Jan.2026>");
   Serial.println("\r\n<Adafruit 2.13 BW+R EPD SCD40 sensor test by Zell 2026>");
-  Serial.printf("-Version %sB, 17.Jan.2025 by Zell-\r\n", version_buf);
+  Serial.printf("-Version %s, 21.Jan.2025 by Zell-\r\n", version_buf);
+  //__DATE__ and __TIME__,
+  Serial.printf("-FW Compile time: %s, date: %s\r\n", __TIME__, __DATE__);
   Serial.println("---Code Configuration---");
   Serial.printf("#Init_test_EPD_EN %u;SCD40Sensor_EN %u;Loop_perodic_update_EN %u\r\n", Init_test_EPD_EN, SCD40Sensor_EN, Loop_perodic_update_EN);
   Serial.printf(">:EPD_width %u;EPD_height %u\r\n", EPD_width, EPD_height);
+  Serial.printf(">:Code FW using EPD_Driver_IC:%s\r\n",EPD_Driver_IC);
   show_SPI_pins();
   show_IIC_pins();
   Serial.println("Turn on Onboard WS2812 LED");
@@ -206,6 +225,7 @@ void setup() {
   //SPI.begin();
   Serial.println(">:init EPD...");
   delay(50);
+  detectEPDChip();
   display.begin(true);
   //display.powerUp();
 
@@ -272,16 +292,18 @@ void setup() {
   display.setTextSize(1);
   testdrawtext(
     "ZELL EPD test,8.Jan.2026. Version 1.02 ! "
-    "2.13 BW+Red HINK E-INK Display,250*122,  Driver Unknown!",
+    "2.13 BW+Red HINK E-INK Display,250*122,  Driver Unknown! SSD1680?",
     COLOR1);
   //
   //display.setFont(&Picopixel);//tiny
-  //display.setFont(&FreeSerifItalic9pt7b); 
+  //display.setFont(&FreeSerifItalic9pt7b);
   int16_t x1, y1;
   uint16_t w, h;
   display.getTextBounds("A", 0, 20, &x1, &y1, &w, &h);
-  Serial.print("Default Font Width: "); Serial.println(w);
-  Serial.print("Font Height: "); Serial.println(h);
+  Serial.print("Default Font Width: ");
+  Serial.println(w);
+  Serial.print("Font Height: ");
+  Serial.println(h);
   /*
   Create a GFXcanvas1 object (an offscreen bitmap) for a fixed-size area, draw custom text in there and copy to the screen using drawBitmap().*/
   display.setFont(&FreeSerifItalic9pt7b);
@@ -313,15 +335,22 @@ void loop() {
   // don't do anything!
   sys_cnt++;
   color_change_idx++;
-  Serial.printf(">>:loop running! %u\r\n", sys_cnt);
-
+  Serial.printf(">>:%u loop running!\r\n", sys_cnt);
+  //Serial.printf(">>:sys_on_time_second %u s\r\n", sys_on_time_second);
+  updateTimeDisplay();
+  Serial.printf("#>sys on time update: %s\r\n", timeDisplayStr);
   sys_on_time_hour = sys_on_time_second / 3600;
   if (sys_on_time_hour > 0) {
-    sys_on_time_second_tmp = sys_on_time_second - sys_on_time_hour * 3600;
-    Serial.printf(">>:sys on time since last boot %u hour,%lu s!\r\n", sys_on_time_hour, sys_on_time_second_tmp);
+    sys_on_time_second_tmp = sys_on_time_second % 3600;
+    //  sys_on_time_second_tmp = sys_on_time_second - sys_on_time_hour*3600;
+    Serial.printf(">>:sys on time since last boot %u hour,%lu s!\r\n", sys_on_time_hour, sys_on_time_second_tmp);  //bug here
+    //Serial.printf(">>: %u hour,%lu s! %lu s\r\n", sys_on_time_hour, sys_on_time_second_tmp,sys_on_time_second); //>>: 1 hour,0 s! 300 s @3900. debug only  1 hour,0 s! 424 s
+    //llu:21:57:46.645 -> >>: 1 hour,124554055534 s! 4633050594506964992 s
+
   } else {
-    Serial.printf(">>:sys on time since last boot %u s!\r\n", sys_on_time_second);
+
     sys_on_time_second_tmp = sys_on_time_second;
+    Serial.printf(">>:sys on time since last boot %lu s!\r\n", sys_on_time_second);
   }
 
   if (1 == color_change_idx)
@@ -375,15 +404,11 @@ void loop() {
 
       //sprintf(text_buf,"SCD40 sensor recorder APP V1.05 by ZELL Jan.2026",CO2_cur,Temperature_cur,Humidity_cur);
       //EPD_draw_title_info(text_buf,COLOR1);
-      if (sys_on_time_hour > 0) {
-        sys_on_time_second_tmp = sys_on_time_second - sys_on_time_hour * 3600;
-        sprintf(text_buf, ">:sys on time %u hour,%lu s!", sys_on_time_hour, sys_on_time_second_tmp);
-        //Serial.printf(">>:sys on time since last boot %u hour,%lu s!\r\n",sys_on_time_hour,sys_on_time_second_tmp);
-      } else {
-        //Serial.printf(">>:sys on time since last boot %u s!\r\n",sys_on_time_second);
-        sys_on_time_second_tmp = sys_on_time_second;
-        sprintf(text_buf, ">:sys on time %lu s!", sys_on_time_second_tmp);
-      }
+
+
+      //sys_on_time_second_tmp = sys_on_time_second;
+      sprintf(text_buf, ">:sys on time %u s!", sys_on_time_second);
+
 
 
 
@@ -398,10 +423,19 @@ void loop() {
       Serial.println("refresh EPD for the first sensor readings finished now!");
       delay(5000);
       CO2_Min = CO2_cur;
-      Serial.println(">>:System benchmark now!");
-      benchBegin();
+      //Serial.println(">>:System benchmark now!");
+      //benchBegin();
       //delay(1);
-      benchEnd(Serial);  //about 970us? bench: 972.5126us (233403 ticks)
+      //benchEnd(Serial);  //about 970us? bench: 972.5126us (233403 ticks)
+      Serial.println("\n═══════════════════════");
+      Serial.println("Beijing Timezone NTP Sync");
+      Serial.println("═════════════════════════\n");
+      if (!connectWiFi()) {
+        Serial.println("⚠️  System will continue but time may be incorrect");
+        Serial.println("💡 Tip: Check WiFi configuration and restart");
+      }
+      initNTP();
+      Init_time_sync();
     }
     if (CO2_cur > CO2_Max) {
       CO2_Max = CO2_cur;
@@ -412,10 +446,19 @@ void loop() {
   }
   if (Loop_WiFi_perodic_update_EN) {
     if (0 == sys_cnt % WiFi_refresh_interval_tmp) {
-      WiFi_connect_quote_test(15);
-      if (wifi_sucess_cnt>0){
-         WiFi_refresh_interval_tmp = wifi_sucess_cnt*EPD_refresh_interval ; 
 
+    if (millis() - lastWiFiCheck > wifiCheckInterval) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("📶 WiFi disconnected, attempting to reconnect...");
+      connectWiFi();
+    }
+    lastWiFiCheck = millis();
+  }
+      checkTimeSync();
+
+      WiFi_connect_quote_test(15);
+      if (wifi_sucess_cnt > 0) {
+        WiFi_refresh_interval_tmp = wifi_sucess_cnt * EPD_refresh_interval;
       }
     }
   }
@@ -423,63 +466,101 @@ void loop() {
     if (0 == sys_cnt % EPD_refresh_interval) {
       leds[0] = CRGB::Red;
       FastLED.show();
+      Serial.println("-------------perodic_update-----------");
       Serial.printf(">>:CO2 Max:%u ;CO2 Min:%u\r\n", CO2_Max, CO2_Min);
+      checkTimeSync();
+      if (timeSynced) {
+        Serial.println("Current system time:");
+        printLocalTime();
+      } else {
+        Serial.println("Global time need synchronization...");
+      }
+
       Serial.println(">>:updating EPD buffer now!");
 
       sprintf(text_buf, "sys_cnt:%u", sys_cnt);
-      testdrawsys_info(text_buf, COLOR1); //will clear buffer
+      testdrawsys_info(text_buf, COLOR1);  //will clear buffer
 
+      /*
       if (sys_on_time_hour > 0) {
         sys_on_time_second_tmp = sys_on_time_second - sys_on_time_hour * 3600;
-        sprintf(text_buf, ">:sys on time %u hour,%lu s!", sys_on_time_hour, sys_on_time_second_tmp);
+        sprintf(text_buf, ">:sys on time %u hour,%u s!", sys_on_time_hour, sys_on_time_second_tmp);
+
+
         //Serial.printf(">>:sys on time since last boot %u hour,%lu s!\r\n",sys_on_time_hour,sys_on_time_second_tmp);
       } else {
         //Serial.printf(">>:sys on time since last boot %u s!\r\n",sys_on_time_second);
         sys_on_time_second_tmp = sys_on_time_second;
-        sprintf(text_buf, ">:sys on time %lu s!", sys_on_time_second_tmp);
+        sprintf(text_buf, ">:sys on time %u s!", sys_on_time_second_tmp);
       }
+      */
+      sprintf(text_buf, ">:sys on time:%s!", timeDisplayStr);
+
       //sprintf(text_buf,">>:sys on time %u hour,%lu s!",sys_on_time_hour,sys_on_time_second_tmp);
       EPD_draw_sys_on_time(text_buf, COLOR1);
-      
-      
+
+
       // display.setFont(&FreeSerif9pt7b);
-      display.setFont(&FreeSans9pt7b); //too big
+      display.setFont(&FreeSans9pt7b);  //too big
       display.setTextSize(2);
-      sprintf(text_buf, "CO2:%u", CO2_cur );
+      sprintf(text_buf, "CO2:%u", CO2_cur);
       Sensor_info_draw(text_buf, COLOR2);
-      display.setFont(&FreeSerif9pt7b); //too big
+      display.setFont(&FreeSerif9pt7b);  //too big
       display.setTextSize(1);
       sprintf(text_buf, "T:%3.1f C", Temperature_cur);
       SensorT_info_draw(text_buf, COLOR2);
       //sprintf(text_buf, "T:%3.1fc H:%3.1f%%", Temperature_cur,Humidity_cur);
       sprintf(text_buf, "H:%3.1f %%", Humidity_cur);
       Sensor_info2_draw(text_buf, COLOR2);
+      Sensor_info2_draw(text_buf, COLOR1);
       //sprintf(text_buf, "CO2:%u,T:%3.1fC,          H:%3.1f%%", CO2_cur, Temperature_cur, Humidity_cur); //ori with def font
 
-      
+
 
       display.setFont();
+
+      sprintf(time_buf,"Tm:%02dh:%02dm:%02ds", 
+               timeinfo.tm_hour, 
+               timeinfo.tm_min, 
+               timeinfo.tm_sec);
+      sprintf(date_buf,"%04d-%02d-%02d", 
+               timeinfo.tm_year + 1900, 
+               timeinfo.tm_mon + 1, 
+               timeinfo.tm_mday);
 
       sprintf(text_buf, "CO2Max:%u,Min:%u", CO2_Max, CO2_Min);
       Sensor_info_MinMax_draw(text_buf, COLOR1);
-      sprintf(text_buf, "Ave:%u, cnt:%u", CO2_ave, CO2_data_cnt);
-      Sensor_info_average_draw(text_buf, COLOR1);
+      //sprintf(text_buf, "Ave:%u,cnt:%u; %s %s", CO2_ave, CO2_data_cnt,time_buf,date_buf);
+      sprintf(text_buf, "Ave: %u, cnt: %u", CO2_ave, CO2_data_cnt);
+      Sensor_info_average_draw(text_buf, COLOR2);
+      Time_info_average_draw(time_buf,COLOR2);
+      Date_info_average_draw(date_buf,COLOR1);
+
+
 
       //display.setFont(&FreeSans9pt7b);
       display.setTextSize(1);
-      sprintf(text_buf, "SCD40 sensor APP V%s by ZELL Jan.2026", version_buf);
+      version_buf[0] = Version_Nrd;
+      version_buf[1] = '.';
+      version_buf[2] = Version_Nrf1;
+      version_buf[3] = Version_Nrf2;
+      memset(text_buf, 0, sizeof(text_buf));
+      sprintf(text_buf, "SCD40 sensor APP V%s by ZELL 2026\r", version_buf);
       EPD_draw_title_info(text_buf, COLOR1);
-      if(wifi_sucess_cnt>0){
+      if (wifi_sucess_cnt > 0) {
 
-        Quote_text_draw(quote_text,EPD_RED);
+        Quote_text_draw(quote_text, EPD_RED);
       }
 
-      Serial.println(">>:Push EPD display refresh now!");
+      Serial.println(">>:...Push EPD display refresh now!...");
       display.display();
+      EPD_display_refresh_cnt++;
+
       display.setFont();
 
       delay(3000);
-      Serial.println(">>:EPD display refresh finished now!");
+      sys_on_time_second += EPD_display_refresh_time + 3;
+      Serial.printf(">>:EPD display refresh finished now! Total refresh cnt:%u\r\n", EPD_display_refresh_cnt);
     }
   }
 
@@ -501,7 +582,8 @@ void loop() {
   delay(50);                //wait for UART
   esp_light_sleep_start();  // Enter light sleep
   Serial.println("!>:Returning from light sleep");
-  sys_on_time_second = sys_on_time_second + sleepTime_seconds;
+  sys_on_time_second += sleepTime_seconds;
+
   //delay(1000);
 }
 
@@ -517,7 +599,7 @@ void testdrawtext2(const char *text, uint16_t color) {
   uint8_t text_height = 16;
   pixel_pos_x = 0;
   //pixel_pos_y = EPD_height / 2 - text_height;
-  pixel_pos_y = EPD_height / 2 ;
+  pixel_pos_y = EPD_height / 2;
   //display.setTextSize(2);
   display.setCursor(pixel_pos_x, pixel_pos_y);
   display.setTextColor(color);
@@ -553,9 +635,21 @@ void EPD_draw_sys_on_time(const char *text, uint16_t color) {
 
 void EPD_draw_title_info(const char *text, uint16_t color) {
   uint8_t text_height = 8;
-  pixel_pos_x = text_height;  //Botton right
+  pixel_pos_x = text_height;  
   pixel_pos_y = 0;
   // display.clearBuffer();
+  display.setTextSize(1);
+  display.setCursor(pixel_pos_x, pixel_pos_y);
+  display.setTextColor(color);
+  display.setTextWrap(true);
+  display.print(text);
+}
+
+void Date_info_average_draw(const char *text, uint16_t color) {
+  uint8_t text_height = 8;
+  pixel_pos_x = EPD_width-EPD_width/4;  
+  pixel_pos_y = text_height+2;
+  //display.clearBuffer();
   display.setTextSize(1);
   display.setCursor(pixel_pos_x, pixel_pos_y);
   display.setTextColor(color);
@@ -567,7 +661,7 @@ void Sensor_info_draw(const char *text, uint16_t color) {
   //first line
   uint8_t text_height = 18;
   pixel_pos_x = 4;  // EPD_weight/2;
-  pixel_pos_y = EPD_height / 2 - 2 * text_height +16;
+  pixel_pos_y = EPD_height / 2 - 2 * text_height + 16;
   //display.clearBuffer();
   //display.setTextSize(2);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -580,8 +674,8 @@ void SensorT_info_draw(const char *text, uint16_t color) {
   //first line
   uint8_t text_height = 18;
   uint8_t text_width = 12;
-  pixel_pos_x = EPD_width/2+4*text_width;  // EPD_weight/2;
-  pixel_pos_y = EPD_height / 2 - 2 * text_height+6;
+  pixel_pos_x = EPD_width / 2 + 4 * text_width;  // EPD_weight/2;
+  pixel_pos_y = EPD_height / 2 - 2 * text_height + 6;
   //display.clearBuffer();
   //display.setTextSize(2);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -595,8 +689,8 @@ void Sensor_info2_draw(const char *text, uint16_t color) {
   uint8_t text_height = 18;
   uint8_t text_width = 12;
   //pixel_pos_x = EPD_width/2-4;  // EPD_weight/2;
-  pixel_pos_x = EPD_width/2+4*text_width;
-  pixel_pos_y = EPD_height / 2 -  text_height +8;
+  pixel_pos_x = EPD_width / 2 + 4 * text_width;
+  pixel_pos_y = EPD_height / 2 - text_height + 8;
   //display.clearBuffer();
   //display.setTextSize(2);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -609,7 +703,7 @@ void Sensor_info2_draw(const char *text, uint16_t color) {
 void Sensor_info_MinMax_draw(const char *text, uint16_t color) {
   uint8_t text_height = 16;
   pixel_pos_x = 4;  // EPD_weight/2;
-  pixel_pos_y = EPD_height / 2 -4 ;
+  pixel_pos_y = EPD_height / 2 - 4;
   //display.clearBuffer();
   display.setTextSize(2);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -642,8 +736,8 @@ void Quote_text_draw(const char *text, uint16_t color) {
 
 void Sensor_info_average_draw(const char *text, uint16_t color) {
   uint8_t text_height = 16;
-  pixel_pos_x = 4;  // EPD_weight/2;
-  pixel_pos_y = EPD_height - 2 * text_height + 4;
+  pixel_pos_x = 4;  // EPD_width/2;
+  pixel_pos_y = EPD_height - 2 * text_height + 6;
   //display.clearBuffer();
   display.setTextSize(1);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -651,6 +745,20 @@ void Sensor_info_average_draw(const char *text, uint16_t color) {
   display.setTextWrap(true);
   display.print(text);
 }
+void Time_info_average_draw(const char *text, uint16_t color) {
+  uint8_t text_height = 16;
+  pixel_pos_x = EPD_width-EPD_width/4-24;  // EPD_weight/2;
+  pixel_pos_y = EPD_height - 2 * text_height + 6;
+  //display.clearBuffer();
+  display.setTextSize(1);
+  display.setCursor(pixel_pos_x, pixel_pos_y);
+  display.setTextColor(color);
+  display.setTextWrap(true);
+  display.print(text);
+}
+
+
+
 void show_IIC_pins(void) {
   Serial.println("ESP32s3 IIC interface:");
   Serial.print("SDA: ");
@@ -682,7 +790,7 @@ void show_SPI_pins(void) {
 */
 }
 
-void WiFi_connect_quote_test (uint8_t retry_cnt){
+void WiFi_connect_quote_test(uint8_t retry_cnt) {
   uint8_t try_cnt = 0;
   Serial.print("Attempting to connect to SSID: ");
   Serial.println(ssid);
@@ -692,9 +800,9 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
     Serial.print(".");
     delay(200);
     try_cnt++;
-    if (retry_cnt<try_cnt){
+    if (retry_cnt < try_cnt) {
       Serial.print(">>: WiFi Connection failed!\r\n");
-      
+
       return;
     }
   }
@@ -702,7 +810,7 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
   Serial.print("Connected to ");
   Serial.println(ssid);
 
-  Serial.printf("\nStarting connection to server: %s...\r\n",server);
+  Serial.printf("\nStarting connection to server: %s...\r\n", server);
   client.setInsecure();
   if (!client.connect(server, 443)) {
     Serial.println("server Connection failed!");
@@ -710,20 +818,23 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
   }
   Serial.println("Connected to server!");
   // Make a HTTP request:
-  client.print("GET "); client.print(path); client.println(" HTTP/1.1");
-  client.print("Host: "); client.println(server);
+  client.print("GET ");
+  client.print(path);
+  client.println(" HTTP/1.1");
+  client.print("Host: ");
+  client.println(server);
   client.println("Connection: close");
   client.println();
 
   // Check HTTP status
-  char status[32] = {0};
+  char status[32] = { 0 };
   client.readBytesUntil('\r', status, sizeof(status));
   if (strcmp(status, "HTTP/1.1 200 OK") != 0) {
     Serial.print(F("Unexpected response: "));
     Serial.println(status);
-   return;
+    return;
   }
-    while (client.connected()) {
+  while (client.connected()) {
     String line = client.readStringUntil('\n');
     if (line == "\r") {
       Serial.println("headers received");
@@ -734,7 +845,7 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
   while (client.peek() != '[') {
     client.read();
   }
-    // Allocate the JSON document
+  // Allocate the JSON document
   // Use arduinojson.org/v6/assistant to compute the capacity.
   const size_t capacity = JSON_ARRAY_SIZE(1) + JSON_OBJECT_SIZE(8) + 200;
   DynamicJsonDocument doc(capacity);
@@ -744,30 +855,33 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.c_str());
-   return;
+    return;
   }
-   // Extract values
+  // Extract values
   JsonObject root_0 = doc[0];
   Serial.println(F("Response:"));
-  const char* root_0_text = root_0["text"];
-  const char* root_0_author = root_0["author"];
-  
-  Serial.print("Quote: "); Serial.println(root_0_text);
-  Serial.print("Author: "); Serial.println(root_0_author);
+  const char *root_0_text = root_0["text"];
+  const char *root_0_author = root_0["author"];
+
+  Serial.print("Quote: ");
+  Serial.println(root_0_text);
+  Serial.print("Author: ");
+  Serial.println(root_0_author);
   //quote_text=  root_0_text;
   strcpy(quote_text, root_0_text);
   //Draw something here!
-
-  Quote_text_draw(root_0_text,EPD_RED);
+  if (sys_cnt < 10) {
+    Quote_text_draw(root_0_text, EPD_BLACK);
+  } else
+    Quote_text_draw(root_0_text, EPD_RED);
   display.display();
   wifi_sucess_cnt++;
-  while (client.available() > 0)
-  {
+  while (client.available() > 0) {
     //read back one line from the server
     String line = client.readStringUntil('\r');
     Serial.println(line);
   }
-  
+
   // disconnect
   client.stop();
   // Turn off WiFi
@@ -775,4 +889,23 @@ void WiFi_connect_quote_test (uint8_t retry_cnt){
   WiFi.mode(WIFI_OFF);
 
   Serial.println("WiFi turned off");
+}
+
+void updateTimeDisplay() {
+  sys_on_time_hour = sys_on_time_second / 3600;
+  uint32_t remaining_seconds = sys_on_time_second % 3600;
+
+  if (sys_on_time_hour > 0) {
+    // 显示小时和分钟
+    uint32_t minutes = remaining_seconds / 60;
+    uint32_t seconds = remaining_seconds % 60;
+    snprintf(timeDisplayStr, sizeof(timeDisplayStr),
+             "%uh:%02um:%02us", sys_on_time_hour, minutes, seconds);
+  } else {
+    // 只显示秒数
+    uint32_t minutes = sys_on_time_second / 60;
+    uint32_t seconds = sys_on_time_second % 60;
+    snprintf(timeDisplayStr, sizeof(timeDisplayStr),
+             "%02u m:%02u s", minutes, seconds);
+  }
 }
