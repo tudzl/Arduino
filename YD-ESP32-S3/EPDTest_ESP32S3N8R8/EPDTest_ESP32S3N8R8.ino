@@ -6,6 +6,7 @@
   Written by Limor Fried/Ladyada for Adafruit Industries.
   MIT license, all text above must be included in any redistribution
  ****************************************************/
+//V1.16 opt of GUI
  //V1.15 added and improved EPD detection function, OPT of GUI display of time and date
 //V1.14 added NTP get time, need test, seems working!
 //V1.13 added timeupdate function, fixed time show bug
@@ -25,6 +26,8 @@
 //depend on Adafruit_EPD and FastLED and SparkFun_SCD4x_Arduino_Library
 
 //use debug port for uploading FW!
+#include <Arduino.h>
+//#include <core_arduino.h> //compile error
 #include "Adafruit_EPD.h"
 #include <Fonts/FreeMonoBold9pt7b.h>  //has a height of about 18 pixels,
 #include <Fonts/FreeMono9pt7b.h>
@@ -46,6 +49,8 @@
 #include <Wire.h>
 
 #include <Benchmark.h>
+
+
 #include "SparkFun_SCD4x_Arduino_Library.h"  //Click here to get the library: http://librarymanager/All#SparkFun_SCD4x
 
 #include "Net_config.h"
@@ -547,6 +552,9 @@ void loop() {
       memset(text_buf, 0, sizeof(text_buf));
       sprintf(text_buf, "SCD40 sensor APP V%s by ZELL 2026\r", version_buf);
       EPD_draw_title_info(text_buf, COLOR1);
+
+      Sensor_ppm_draw("PPM", COLOR1);
+      
       if (wifi_sucess_cnt > 0) {
 
         Quote_text_draw(quote_text, EPD_RED);
@@ -683,7 +691,7 @@ void SensorT_info_draw(const char *text, uint16_t color) {
   display.setTextWrap(true);
   display.print(text);
 }
-
+//Hum
 void Sensor_info2_draw(const char *text, uint16_t color) {
   //second line
   uint8_t text_height = 18;
@@ -693,6 +701,21 @@ void Sensor_info2_draw(const char *text, uint16_t color) {
   pixel_pos_y = EPD_height / 2 - text_height + 8;
   //display.clearBuffer();
   //display.setTextSize(2);
+  display.setCursor(pixel_pos_x, pixel_pos_y);
+  display.setTextColor(color);
+  display.setTextWrap(true);
+  display.print(text);
+}
+
+void Sensor_ppm_draw(const char *text, uint16_t color) {
+  //second line
+  uint8_t text_height = 8;
+  uint8_t text_width = 6;
+  //pixel_pos_x = EPD_width/2-4;  // EPD_weight/2;
+  pixel_pos_x = EPD_width / 2 + 3 * text_width;
+  pixel_pos_y = EPD_height / 2 - 2*text_height ;
+  //display.clearBuffer();
+  display.setTextSize(1);
   display.setCursor(pixel_pos_x, pixel_pos_y);
   display.setTextColor(color);
   display.setTextWrap(true);
@@ -748,7 +771,7 @@ void Sensor_info_average_draw(const char *text, uint16_t color) {
 void Time_info_average_draw(const char *text, uint16_t color) {
   uint8_t text_height = 16;
   pixel_pos_x = EPD_width-EPD_width/4-24;  // EPD_weight/2;
-  pixel_pos_y = EPD_height - 2 * text_height + 6;
+  pixel_pos_y = EPD_height - 2 * text_height + 8;
   //display.clearBuffer();
   display.setTextSize(1);
   display.setCursor(pixel_pos_x, pixel_pos_y);
