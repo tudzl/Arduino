@@ -1,5 +1,6 @@
 //header for detect Driver IC
-
+#ifndef EPD_detect_H
+#define EPD_detect_H
 void detectEPDChip();
 bool testPartialRefresh();
 bool sendInitSequence(uint8_t* sequence, int length);
@@ -300,3 +301,5 @@ bool sendInitSequence(uint8_t* sequence, int length) {
   
   return true;
 }
+
+#endif

@@ -1,3 +1,6 @@
+#ifndef EPD_Net_H
+#define EPD_Net_H
+
 #include <WiFiClientSecure.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
@@ -192,6 +195,7 @@ String getFormattedDateTime() {
   return String(buffer);
 }
 
+#endif
 /*
 https://www.programiz.com/c-programming/online-compiler/
 

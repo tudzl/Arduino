@@ -6,7 +6,11 @@
   Written by Limor Fried/Ladyada for Adafruit Industries.
   MIT license, all text above must be included in any redistribution
  ****************************************************/
-//V1.16 opt of GUI
+ //V1.20 fixed a sys_cnt error bug, added delay after wake up solved the issue.
+ //V1.19 improved co2 ave max min display to single line
+//V1.18 try fixing Temp. min record bugs, done! also improved sys on time accuracy
+ //V1.17 added EEPROM, additional temperature history vars
+//V1.16 opt of GUI, added ppm show
  //V1.15 added and improved EPD detection function, OPT of GUI display of time and date
 //V1.14 added NTP get time, need test, seems working!
 //V1.13 added timeupdate function, fixed time show bug
@@ -54,6 +58,9 @@
 #include "SparkFun_SCD4x_Arduino_Library.h"  //Click here to get the library: http://librarymanager/All#SparkFun_SCD4x
 
 #include "Net_config.h"
+#include "EPD_temperature_define.h"
+#include <EEPROM.h>
+#define EEPROM_SIZE 512
 
 
 SCD4x SCD40Sensor;                 //The default I2C address for the SCD4x is 0x62.
@@ -61,7 +68,7 @@ SCD4x SCD40Sensor;                 //The default I2C address for the SCD4x is 0x
 //versions
 #define Version_Nrd '1'
 #define Version_Nrf1 '1'  //2._x
-#define Version_Nrf2 '3'  //2.x_
+#define Version_Nrf2 '9'  //2.x_
 
 #define Init_test_EPD_EN 0
 #define SCD40Sensor_EN 1
@@ -69,10 +76,14 @@ SCD4x SCD40Sensor;                 //The default I2C address for the SCD4x is 0x
 #define Loop_WiFi_perodic_update_EN 1
 #define WiFi_refresh_interval 5
 uint16_t WiFi_refresh_interval_tmp = WiFi_refresh_interval;
+#define Sensor_temperature_history_record_EN 1
 
-#define EPD_refresh_interval 15                    //30
+#define EEPROM_save_EN 0
+#define EPD_refresh_interval 30                    //30
+#define EEPROM_save_interval 1500
 uint32_t sleepTime = ESP32_sleep_interval * 1000;  // Sleep duration in microseconds (1 seconds)
 uint32_t sys_on_time_second = 0;
+uint32_t sys_on_time_milis = 0;
 uint32_t sys_on_time_hour = 0;
 uint32_t sys_on_time_second_tmp = 0;
 uint32_t sleepTime_seconds = ESP32_sleep_interval / 1000;
@@ -209,14 +220,15 @@ void setup() {
 
   // while (!Serial) { delay(10); }
   //Serial.println("\r\n<Adafruit 2.13 BW+R EPD SCD40 sensor test V1.08B by Zell Jan.2026>");
-  Serial.println("\r\n<Adafruit 2.13 BW+R EPD SCD40 sensor test by Zell 2026>");
-  Serial.printf("-Version %s, 21.Jan.2025 by Zell-\r\n", version_buf);
+  Serial.println("\r\n<Adafruit 2.13' BW+R EPD SCD40 sensor test by Zell 2026>");
+  Serial.printf("-Version %s, 03.Feb.2025 by Zell-\r\n", version_buf);
   //__DATE__ and __TIME__,
   Serial.printf("-FW Compile time: %s, date: %s\r\n", __TIME__, __DATE__);
   Serial.println("---Code Configuration---");
   Serial.printf("#Init_test_EPD_EN %u;SCD40Sensor_EN %u;Loop_perodic_update_EN %u\r\n", Init_test_EPD_EN, SCD40Sensor_EN, Loop_perodic_update_EN);
   Serial.printf(">:EPD_width %u;EPD_height %u\r\n", EPD_width, EPD_height);
   Serial.printf(">:Code FW using EPD_Driver_IC:%s\r\n",EPD_Driver_IC);
+  Serial.printf(">:ESP32 sleep interval:%u s, EPD update interval:%u s\r\n",sleepTime_seconds,EPD_refresh_interval*sleepTime_seconds);
   show_SPI_pins();
   show_IIC_pins();
   Serial.println("Turn on Onboard WS2812 LED");
@@ -271,6 +283,19 @@ void setup() {
     }
   }
 
+  if(Sensor_temperature_history_record_EN){
+    Serial.println("#>:Temperature_history_record enabled! Initialize temperature history variables now!");
+        // Initialize temperature history variables
+    resetTemperatureStats();
+    resetDailyTemperatureStats();
+    
+    // Initialize circular buffer
+    memset(temperature_rolling_history, 0, sizeof(temperature_rolling_history));
+    
+    // Set initial daily reset time
+    last_daily_reset_time = millis();
+  }
+
   display.clearBuffer();
   if (Init_test_EPD_EN) {
     Serial.println(">:Draw test lines...");
@@ -296,7 +321,7 @@ void setup() {
   //test only
   display.setTextSize(1);
   testdrawtext(
-    "ZELL EPD test,8.Jan.2026. Version 1.02 ! "
+    "ZELL EPD test,29.Jan.2026. Version 1.17 ! "
     "2.13 BW+Red HINK E-INK Display,250*122,  Driver Unknown! SSD1680?",
     COLOR1);
   //
@@ -334,29 +359,40 @@ void setup() {
   } else {
     Serial.println("Failed to set Timer Wake-Up as wake-up source.");
   }
+  sys_cnt = 0;
 }
 
 void loop() {
   // don't do anything!
   sys_cnt++;
   color_change_idx++;
-  Serial.printf(">>:%u loop running!\r\n", sys_cnt);
+  Serial.printf(">>:%luth loop running!\r\n", sys_cnt);
   //Serial.printf(">>:sys_on_time_second %u s\r\n", sys_on_time_second);
+  Temperature_stats.timestamp = millis();
+    sys_on_time_second=Temperature_stats.timestamp/1000;
   updateTimeDisplay();
+  
   Serial.printf("#>sys on time update: %s\r\n", timeDisplayStr);
   sys_on_time_hour = sys_on_time_second / 3600;
   if (sys_on_time_hour > 0) {
     sys_on_time_second_tmp = sys_on_time_second % 3600;
     //  sys_on_time_second_tmp = sys_on_time_second - sys_on_time_hour*3600;
-    Serial.printf(">>:sys on time since last boot %u hour,%lu s!\r\n", sys_on_time_hour, sys_on_time_second_tmp);  //bug here
+    Serial.printf("##>:sys on time since last boot %u hour,%lu s!\r\n", sys_on_time_hour, sys_on_time_second_tmp);  //bug here
     //Serial.printf(">>: %u hour,%lu s! %lu s\r\n", sys_on_time_hour, sys_on_time_second_tmp,sys_on_time_second); //>>: 1 hour,0 s! 300 s @3900. debug only  1 hour,0 s! 424 s
     //llu:21:57:46.645 -> >>: 1 hour,124554055534 s! 4633050594506964992 s
+    
 
-  } else {
+  } 
+  /*
+  else {
 
-    sys_on_time_second_tmp = sys_on_time_second;
-    Serial.printf(">>:sys on time since last boot %lu s!\r\n", sys_on_time_second);
+    //sys_on_time_second_tmp = sys_on_time_second;
+    //Serial.printf("#>:sys on time since last boot %lu s!\r\n", sys_on_time_second);
+    //Temperature_stats.timestamp = millis();
+    Serial.printf("#>:sys on time since last boot %lu s(from millis)!\r\n", Temperature_stats.timestamp/1000); //debug only
+    //sys_on_time_second=Temperature_stats.timestamp/1000;
   }
+  */
 
   if (1 == color_change_idx)
     leds[0] = CRGB::Coral;
@@ -377,8 +413,11 @@ void loop() {
       Humidity_cur = SCD40Sensor.getHumidity();
       CO2_data_cnt++;
       Serial.printf("CO2(ppm): %u ", CO2_cur);
+      delay(5);
       Serial.printf("\tTemperature(C): %3.1f ", Temperature_cur);
+      delay(5);
       Serial.printf("\tHumidity(%RH): %3.1f%%\r\n", Humidity_cur);
+      delay(5);
       if (CO2_data_idx < CO2_history_ave_size) {
         CO2_history[CO2_data_idx] = CO2_cur;
         CO2_data_idx++;
@@ -393,7 +432,19 @@ void loop() {
       } else {
         CO2_ave = CO2_SUM_tmp / CO2_history_ave_size;
       }
-      Serial.printf("#>:Average CO2(ppm): %u (total data counts:%u)", CO2_ave, CO2_data_cnt);
+      Serial.printf("#>:Average CO2(ppm): %u (total data counts:%u)\r\n", CO2_ave, CO2_data_cnt);
+
+              // 更新温度统计数据
+      Serial.printf(">:UpdateTemperatureStats now!.%u\r\n",temperature_reading_count);
+      updateTemperatureStats(Temperature_cur);
+       temperature_reading_count++; 
+        // 定期打印统计数据（例如每10次读数）
+      if (0==temperature_reading_count % 4) {
+         Serial.println(">:UpdateTemperatureStats now!");
+         delay(5);
+            printTemperatureStats();
+            delay(10);
+        }
       //Serial.print(CO2_cur);
 
       //Serial.print(F("\tTemperature(C):" ));
@@ -483,7 +534,7 @@ void loop() {
 
       Serial.println(">>:updating EPD buffer now!");
 
-      sprintf(text_buf, "sys_cnt:%u", sys_cnt);
+      sprintf(text_buf, "sys_cnt:%lu", sys_cnt);
       testdrawsys_info(text_buf, COLOR1);  //will clear buffer
 
       /*
@@ -533,12 +584,14 @@ void loop() {
                timeinfo.tm_mon + 1, 
                timeinfo.tm_mday);
 
-      sprintf(text_buf, "CO2Max:%u,Min:%u", CO2_Max, CO2_Min);
+      //sprintf(text_buf, "CO2Max:%u,Min:%u", CO2_Max, CO2_Min);
+      //Sensor_info_MinMax_draw(text_buf, COLOR1);
+      sprintf(text_buf, "#%u,Max%u,Min%u",CO2_ave,CO2_Max, CO2_Min);
       Sensor_info_MinMax_draw(text_buf, COLOR1);
       //sprintf(text_buf, "Ave:%u,cnt:%u; %s %s", CO2_ave, CO2_data_cnt,time_buf,date_buf);
-      sprintf(text_buf, "Ave: %u, cnt: %u", CO2_ave, CO2_data_cnt);
-      Sensor_info_average_draw(text_buf, COLOR2);
-      Time_info_average_draw(time_buf,COLOR2);
+      //sprintf(text_buf, "Co2Ave: %u, cnt: %u", CO2_ave, CO2_data_cnt);
+      //Sensor_info_average_draw(text_buf, COLOR2);
+      Time_info_draw(time_buf,COLOR2);
       Date_info_average_draw(date_buf,COLOR1);
 
 
@@ -560,6 +613,14 @@ void loop() {
         Quote_text_draw(quote_text, EPD_RED);
       }
 
+      if(Sensor_temperature_history_record_EN){
+            //sprintf(temp_stats_buf, "Tmax:%.1f Tmin:%.1f", 
+            Serial.println(">>:Update temperature_history_max_min now...");
+            sprintf(text_buf, "T:v%3.1f ^%.1f;Daily:%.1f/%.1f", 
+            temperature_history_min,temperature_history_max,temperature_daily_min, temperature_daily_max);
+            EPD_draw_Tmax_Tmin_info(text_buf, COLOR1);
+      }
+
       Serial.println(">>:...Push EPD display refresh now!...");
       display.display();
       EPD_display_refresh_cnt++;
@@ -572,6 +633,15 @@ void loop() {
     }
   }
 
+
+  if((SCD40Sensor_exist)&&(EEPROM_save_EN)){
+    if(0==sys_cnt % EEPROM_save_interval){
+      
+      saveTemperatureStatsToEEPROM();
+    }
+
+
+  }
   /*
     if (SCD40Sensor_EN){
         if (SCD40Sensor.begin() == false)
@@ -584,12 +654,14 @@ void loop() {
     }
   }
   */
-  Serial.println(">>:Going into light sleep mode,turn off WS2812 LED now!\r\n");
-  leds[0] = CRGB::Black;
-  FastLED.show();
+  Serial.println(">>:Going into light sleep status,WS2812 LED off now!\r\n");
+  //leds[0] = CRGB::Black;
+  FastLED.clear();
   delay(50);                //wait for UART
   esp_light_sleep_start();  // Enter light sleep
-  Serial.println("!>:Returning from light sleep");
+  Serial.println("!>:Wake up from sleep!");
+  delay(50);
+
   sys_on_time_second += sleepTime_seconds;
 
   //delay(1000);
@@ -734,6 +806,19 @@ void Sensor_info_MinMax_draw(const char *text, uint16_t color) {
   display.setTextWrap(true);
   display.print(text);
 }
+void EPD_draw_Tmax_Tmin_info(const char *text, uint16_t color){
+  uint8_t text_height = 8;
+  pixel_pos_x = text_height;  
+  pixel_pos_y = text_height;
+  //display.clearBuffer();
+  display.setTextSize(1);
+  display.setCursor(pixel_pos_x, pixel_pos_y);
+  display.setTextColor(color);
+  display.setTextWrap(true);
+  display.print(text);
+
+
+}
 
 void EPD_test_draw_rect(void) {
   //Serial.println("Color rectangle demo");
@@ -760,7 +845,7 @@ void Quote_text_draw(const char *text, uint16_t color) {
 void Sensor_info_average_draw(const char *text, uint16_t color) {
   uint8_t text_height = 16;
   pixel_pos_x = 4;  // EPD_width/2;
-  pixel_pos_y = EPD_height - 2 * text_height + 6;
+  pixel_pos_y = EPD_height - 2 * text_height + 8;
   //display.clearBuffer();
   display.setTextSize(1);
   display.setCursor(pixel_pos_x, pixel_pos_y);
@@ -768,7 +853,7 @@ void Sensor_info_average_draw(const char *text, uint16_t color) {
   display.setTextWrap(true);
   display.print(text);
 }
-void Time_info_average_draw(const char *text, uint16_t color) {
+void Time_info_draw(const char *text, uint16_t color) {
   uint8_t text_height = 16;
   pixel_pos_x = EPD_width-EPD_width/4-24;  // EPD_weight/2;
   pixel_pos_y = EPD_height - 2 * text_height + 8;
@@ -893,7 +978,7 @@ void WiFi_connect_quote_test(uint8_t retry_cnt) {
   //quote_text=  root_0_text;
   strcpy(quote_text, root_0_text);
   //Draw something here!
-  if (sys_cnt < 10) {
+  if (sys_cnt < EPD_refresh_interval) {
     Quote_text_draw(root_0_text, EPD_BLACK);
   } else
     Quote_text_draw(root_0_text, EPD_RED);
@@ -932,3 +1017,47 @@ void updateTimeDisplay() {
              "%02u m:%02u s", minutes, seconds);
   }
 }
+
+
+void saveTemperatureStatsToEEPROM() {
+    EEPROM.begin(EEPROM_SIZE);
+    
+    int addr = 0;
+    EEPROM.put(addr, temperature_history_max);
+    addr += sizeof(float);
+    EEPROM.put(addr, temperature_history_min);
+    addr += sizeof(float);
+    EEPROM.put(addr, temperature_history_sum);
+    addr += sizeof(float);
+    EEPROM.put(addr, temperature_reading_count);
+    addr += sizeof(uint32_t);
+    
+    EEPROM.commit();
+    EEPROM.end();
+    
+    Serial.println(">:Temperature history stats saved to EEPROM");
+}
+
+void loadTemperatureStatsFromEEPROM() {
+    EEPROM.begin(EEPROM_SIZE);
+    
+    int addr = 0;
+    EEPROM.get(addr, temperature_history_max);
+    addr += sizeof(float);
+    EEPROM.get(addr, temperature_history_min);
+    addr += sizeof(float);
+    EEPROM.get(addr, temperature_history_sum);
+    addr += sizeof(float);
+    EEPROM.get(addr, temperature_reading_count);
+    
+    // Recalculate average
+    if (temperature_reading_count > 0) {
+        temperature_history_avg = temperature_history_sum / temperature_reading_count;
+    }
+    
+    EEPROM.end();
+    
+    Serial.println(">:Temperature history stats loaded from EEPROM");
+}//https://deepbluembedded.com/esp32-eeprom-library-tutorial-arduino/
+
+//end main ino
