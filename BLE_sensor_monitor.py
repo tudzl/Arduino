@@ -28,13 +28,21 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
 
-#to fix version 1603 issue
-#import platform 
-#platform.mac_ver = lambda: ('26.3', ('', '', ''), 'arm64')
+# ========== Version Info ==========
+APP_VERSION = {
+    "name": "BLE + UART Sensor Monitor",
+    "version": "1.3",
+    "date": "8.June.2026",
+    "author": "ZELL",
+    "email": "tudzl@hotmail.de",
+    "target": "ESP32C3 ZELL_C3ENV_Sensor",
+    "requires": "bleak, matplotlib, pyserial",
+}
 
 # ========== Configuration ==========
-BLE_DEVICE_NAME = "ZELL_C3ENV_Sensor"
+BLE_DEVICE_NAME = "ZELL_C3ENV"  # matches both short name and full name containing this prefix
 BLE_COMPANY_ID = 0x90FC  # little-endian: 0xFC, 0x90
+BLE_SERVICE_DATA_UUID = "0000fc90-0000-1000-8000-00805f9b34fb"  # 16-bit 0xFC90 as 128-bit
 SEA_LEVEL_PRESSURE_HPA = 1025.1
 MAX_HISTORY = 500
 SCAN_INTERVAL_S = 2.0
@@ -72,6 +80,35 @@ def decode_manufacturer_data(raw_bytes):
 
     return {
         "version": version,
+        "temperature": temp,
+        "humidity": humidity,
+        "pressure": pressure,
+        "altitude": altitude,
+    }
+
+
+def decode_scan_response_service_data(raw_bytes):
+    """Decode scan response service data: plaintext 'T23.5 H65.2 P1013.2' from UUID 0xFC90."""
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+    m = re.match(r"T([-\d.]+|--)\s+H([-\d.]+|--)\s+P([-\d.]+|--)", text)
+    if not m:
+        return None
+
+    temp_str, hum_str, press_str = m.group(1), m.group(2), m.group(3)
+    temp = None if temp_str == "--" else float(temp_str)
+    humidity = None if hum_str == "--" else float(hum_str)
+    pressure = None if press_str == "--" else float(press_str)
+
+    altitude = None
+    if pressure is not None:
+        altitude = 44330.0 * (1.0 - math.pow(pressure / SEA_LEVEL_PRESSURE_HPA, 1.0 / 5.255))
+
+    return {
+        "version": "SR",
         "temperature": temp,
         "humidity": humidity,
         "pressure": pressure,
@@ -212,7 +249,8 @@ class SerialReader:
 
     def send_command(self, cmd):
         if self._serial and self._serial.is_open:
-            self._serial.write((cmd + "\n").encode())
+            self._serial.write((cmd + "\r\n").encode())
+            self._serial.flush()
 
     def _run(self, port, baudrate):
         try:
@@ -254,8 +292,9 @@ class SerialReader:
 # ========== BLE Scanner Thread ==========
 
 class BLEScanner:
-    def __init__(self, data_callback):
+    def __init__(self, data_callback, status_callback=None):
         self.data_callback = data_callback
+        self.status_callback = status_callback
         self.running = False
         self._thread = None
 
@@ -274,6 +313,7 @@ class BLEScanner:
         from bleak import BleakScanner
 
         while self.running:
+            found_this_scan = False
             try:
                 devices = await BleakScanner.discover(
                     timeout=SCAN_INTERVAL_S,
@@ -282,26 +322,55 @@ class BLEScanner:
                 for addr, (device, adv_data) in devices.items():
                     if not self._match_device(device, adv_data):
                         continue
+                    found_this_scan = True
+                    print(f"[BLE] Found: {device.name or 'N/A'} ({addr}) RSSI={adv_data.rssi}dBm")
+
+                    result = None
+
+                    # Method 1: manufacturer data (advData)
                     mfr = adv_data.manufacturer_data
                     for company_id, raw in mfr.items():
                         if company_id == BLE_COMPANY_ID:
                             full_data = bytes([company_id & 0xFF, (company_id >> 8) & 0xFF]) + raw
                             result = decode_manufacturer_data(full_data)
                             if result:
-                                result["source"] = "BLE"
-                                result["rssi"] = adv_data.rssi
-                                result["timestamp"] = datetime.now()
-                                self.data_callback(result)
+                                result["source"] = "BLE/MFR"
+                                print(f"[BLE] Decoded via manufacturer data")
                             break
+
+                    # Method 2: scan response service data (UUID 0xFC90 plaintext)
+                    if result is None:
+                        svc_data = adv_data.service_data
+                        for uuid_str, raw in svc_data.items():
+                            if "fc90" in uuid_str.lower():
+                                result = decode_scan_response_service_data(raw)
+                                if result:
+                                    result["source"] = "BLE/SR"
+                                    print(f"[BLE] Decoded via scan response: {raw.decode('utf-8', errors='replace').strip()}")
+                                break
+
+                    if result:
+                        result["rssi"] = adv_data.rssi
+                        result["timestamp"] = datetime.now()
+                        self.data_callback(result)
+                    else:
+                        print(f"[BLE] Device found but data decode failed. "
+                              f"MFR keys={list(mfr.keys())}, SVC keys={list(adv_data.service_data.keys())}")
             except Exception as e:
                 print(f"[BLE Error] {e}")
                 await asyncio.sleep(2)
+
+            if self.status_callback:
+                self.status_callback(found_this_scan)
 
     def _match_device(self, device, adv_data):
         if device.name and BLE_DEVICE_NAME in device.name:
             return True
         if BLE_COMPANY_ID in adv_data.manufacturer_data:
             return True
+        for uuid_str in adv_data.service_data.keys():
+            if "fc90" in uuid_str.lower():
+                return True
         return False
 
 
@@ -310,16 +379,18 @@ class BLEScanner:
 class SensorMonitorApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("BLE + UART Sensor Monitor V1.1 - ZELL_C3ENV_Sensor")
+        self.root.title(f"{APP_VERSION['name']} V{APP_VERSION['version']} - {BLE_DEVICE_NAME}")
         self.root.geometry("1200x850")
         self.root.minsize(1000, 700)
 
         self.history = deque(maxlen=MAX_HISTORY)
-        self.scanner = BLEScanner(self._on_data_received)
+        self.scanner = BLEScanner(self._on_data_received, self._on_ble_status)
         self.serial_reader = None
         self._pending_data = []
         self._pending_logs = []
         self._lock = threading.Lock()
+        self._ble_device_found = False
+        self._ble_last_seen = 0
 
         self._build_ui()
         self._start_scanner()
@@ -336,6 +407,15 @@ class SensorMonitorApp:
 
         self.lbl_status = ttk.Label(values_frame, text="Scanning via BLE...", font=("Consolas", 9))
         self.lbl_status.grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 3))
+
+        # BLE device indicator (blue=found, gray=not found)
+        ble_ind_frame = ttk.Frame(values_frame)
+        ble_ind_frame.grid(row=0, column=4, sticky=tk.E, padx=(10, 0))
+        self.ble_indicator = tk.Canvas(ble_ind_frame, width=16, height=16, highlightthickness=0)
+        self.ble_indicator.pack(side=tk.LEFT)
+        self._ble_led = self.ble_indicator.create_oval(2, 2, 14, 14, fill="gray", outline="darkgray")
+        self.lbl_ble_ind = ttk.Label(ble_ind_frame, text="BLE: N/A", font=("Consolas", 8))
+        self.lbl_ble_ind.pack(side=tk.LEFT, padx=(3, 0))
 
         labels = ["Temperature", "Humidity", "Pressure", "Altitude"]
         units = ["°C", "%", "hPa", "m"]
@@ -355,6 +435,7 @@ class SensorMonitorApp:
         ttk.Button(ctrl_frame, text="Clear History", command=self._clear_history).pack(pady=2, fill=tk.X)
         self.lbl_count = ttk.Label(ctrl_frame, text="Records: 0")
         self.lbl_count.pack(pady=2)
+        ttk.Button(ctrl_frame, text="About", command=self._show_about).pack(pady=2, fill=tk.X)
 
         # ===== Serial port frame =====
         serial_frame = ttk.LabelFrame(self.root, text="UART Serial Port", padding=5)
@@ -379,28 +460,60 @@ class SensorMonitorApp:
         self.entry_cmd.bind("<Return>", self._send_serial_cmd)
         ttk.Button(port_row, text="Send", command=self._send_serial_cmd).pack(side=tk.LEFT, padx=2)
 
-        # UART log
-        log_frame = ttk.Frame(serial_frame)
-        log_frame.pack(fill=tk.X, pady=(3, 0))
-        self.uart_log = tk.Text(log_frame, height=4, font=("Consolas", 8), wrap=tk.NONE, state=tk.DISABLED)
+        # UART log + History/Charts in a resizable PanedWindow
+        paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(3, 0))
+
+        # -- Pane 1: UART log (resizable height) --
+        log_pane = ttk.LabelFrame(paned, text="UART Log (drag border to resize)", padding=3)
+        log_frame = ttk.Frame(log_pane)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        self.uart_log = tk.Text(log_frame, height=7, font=("Consolas", 8), wrap=tk.NONE,
+                                bg="#2E2E2E", fg="#2E8B57", insertbackground="#FFFFFF", state=tk.DISABLED)
+        self.uart_log.tag_configure("cmd", foreground="#FFA500")
         log_scroll_y = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.uart_log.yview)
         log_scroll_x = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL, command=self.uart_log.xview)
         self.uart_log.configure(yscrollcommand=log_scroll_y.set, xscrollcommand=log_scroll_x.set)
-        self.uart_log.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        log_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.uart_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        paned.add(log_pane, weight=1)
+
+        # -- Pane 2: History + Charts --
+        bottom_pane = ttk.Frame(paned)
+        paned.add(bottom_pane, weight=3)
 
         self._refresh_ports()
 
         # ===== History table =====
-        table_frame = ttk.LabelFrame(self.root, text="History", padding=3)
-        table_frame.pack(fill=tk.X, padx=10, pady=(5, 3))
+        table_frame = ttk.LabelFrame(bottom_pane, text="History", padding=3)
+        table_frame.pack(fill=tk.X, pady=(5, 3))
 
-        cols = ("Time", "Source", "Temp(°C)", "Humidity(%)", "Pressure(hPa)", "Altitude(m)", "RSSI")
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=5)
+        style = ttk.Style()
+        style.configure("History.Treeview",
+                        background="#F5F5F0",
+                        foreground="#333333",
+                        fieldbackground="#F5F5F0",
+                        font=("Consolas", 9))
+        style.configure("History.Treeview.Heading",
+                        background="#E0E0D8",
+                        foreground="#2C3E50",
+                        font=("Segoe UI", 9, "bold"))
+        style.map("History.Treeview",
+                  background=[("selected", "#B3D9FF")],
+                  foreground=[("selected", "#1A1A1A")])
+
+        cols = ("Time", "Idx", "Source", "Temp(°C)", "Humidity(%)", "Pressure(hPa)", "Altitude(m)", "RSSI")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=5,
+                                 style="History.Treeview")
+        self.tree.tag_configure("oddrow", background="#EDEDEA")
+        self.tree.tag_configure("evenrow", background="#F5F5F0")
+        self._row_index = 0
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=110, anchor=tk.CENTER)
         self.tree.column("Time", width=145)
+        self.tree.column("Idx", width=45)
         self.tree.column("Source", width=70)
         self.tree.column("RSSI", width=60)
 
@@ -410,8 +523,8 @@ class SensorMonitorApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # ===== Charts =====
-        chart_frame = ttk.Frame(self.root)
-        chart_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        chart_frame = ttk.Frame(bottom_pane)
+        chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.fig = Figure(figsize=(10, 3.5), dpi=90)
         self.fig.set_tight_layout(True)
@@ -422,7 +535,7 @@ class SensorMonitorApp:
             self.fig.add_subplot(2, 2, 4),
         ]
         titles = ["Temperature (°C)", "Humidity (%)", "Pressure (hPa)", "Altitude (m)"]
-        colors = ["#E63946", "#457B9D", "#2A9D8F", "#E9C46A"]
+        colors = ["#FF8C00", "#87CEEB", "#2A9D8F", "#8B0000"]
         self.chart_colors = colors
         for ax, title in zip(self.axes, titles):
             ax.set_title(title, fontsize=9)
@@ -483,13 +596,29 @@ class SensorMonitorApp:
 
     def _append_uart_log(self, text):
         self.uart_log.config(state=tk.NORMAL)
-        self.uart_log.insert(tk.END, text + "\n")
+        tag = "cmd" if text.startswith(">>>") else None
+        self.uart_log.insert(tk.END, text + "\n", tag)
         self.uart_log.see(tk.END)
-        # Keep log manageable
         line_count = int(self.uart_log.index('end-1c').split('.')[0])
         if line_count > 200:
             self.uart_log.delete('1.0', f'{line_count - 200}.0')
         self.uart_log.config(state=tk.DISABLED)
+
+    # ===== BLE status =====
+
+    def _on_ble_status(self, found):
+        with self._lock:
+            self._ble_device_found = found
+            if found:
+                self._ble_last_seen = time.time()
+
+    def _update_ble_indicator(self):
+        if self._ble_device_found or (time.time() - self._ble_last_seen < 10):
+            self.ble_indicator.itemconfig(self._ble_led, fill="#2196F3", outline="#1565C0")
+            self.lbl_ble_ind.config(text="BLE: Online")
+        else:
+            self.ble_indicator.itemconfig(self._ble_led, fill="gray", outline="darkgray")
+            self.lbl_ble_ind.config(text="BLE: N/A")
 
     # ===== Data handling =====
 
@@ -519,6 +648,7 @@ class SensorMonitorApp:
             self._update_charts()
             self.lbl_count.config(text=f"Records: {len(self.history)}")
 
+        self._update_ble_indicator()
         self.root.after(500, self._poll_data)
 
     def _update_current_values(self, data):
@@ -536,6 +666,7 @@ class SensorMonitorApp:
         self.lbl_status.config(text=f"Last: {ts} | Source: {source} | RSSI: {rssi} dBm | Ver: {data.get('version', '-')}")
 
     def _add_table_row(self, data):
+        self._row_index += 1
         ts = data["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
         source = data.get("source", "?")
         temp = f"{data['temperature']:.1f}" if data["temperature"] is not None else "---"
@@ -544,7 +675,9 @@ class SensorMonitorApp:
         alt = f"{data['altitude']:.1f}" if data["altitude"] is not None else "---"
         rssi = str(data.get("rssi", "-"))
 
-        self.tree.insert("", 0, values=(ts, source, temp, hum, press, alt, rssi))
+        row_count = len(self.tree.get_children())
+        tag = "oddrow" if row_count % 2 else "evenrow"
+        self.tree.insert("", 0, values=(ts, self._row_index, source, temp, hum, press, alt, rssi), tags=(tag,))
         children = self.tree.get_children()
         if len(children) > 100:
             for item in children[100:]:
@@ -606,6 +739,7 @@ class SensorMonitorApp:
 
     def _clear_history(self):
         self.history.clear()
+        self._row_index = 0
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._update_charts()
@@ -613,6 +747,33 @@ class SensorMonitorApp:
         for lbl in self.value_labels:
             lbl.config(text="---")
         self.lbl_status.config(text="History cleared. Scanning...")
+
+    def _show_about(self):
+        about_win = tk.Toplevel(self.root)
+        about_win.title("About")
+        about_win.resizable(False, False)
+        about_win.grab_set()
+
+        frame = ttk.Frame(about_win, padding=20)
+        frame.pack()
+
+        v = APP_VERSION
+        ttk.Label(frame, text=v["name"], font=("Segoe UI", 12, "bold")).pack(pady=(0, 5))
+        info_lines = [
+            f"Version: {v['version']}",
+            f"Date: {v['date']}",
+            f"Author: {v['author']} ({v['email']})",
+            f"Target Device: {v['target']}",
+            f"Dependencies: {v['requires']}",
+            "",
+            "Receives sensor data via BLE broadcast",
+            "and/or UART serial port. Displays current",
+            "values, history table, and trend charts.",
+        ]
+        for line in info_lines:
+            ttk.Label(frame, text=line, font=("Consolas", 9)).pack(anchor=tk.W)
+
+        ttk.Button(frame, text="OK", command=about_win.destroy).pack(pady=(12, 0))
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -626,8 +787,8 @@ class SensorMonitorApp:
 
 
 if __name__ == "__main__":
-    print("BLE + UART Sensor Monitor GUI based on tkinter starting...")
-    print("Version:1.1,7.June.2026, ZELL")
+    print(f"{APP_VERSION['name']} GUI based on tkinter starting...")
+    print(f"Version:{APP_VERSION['version']}, {APP_VERSION['date']}, {APP_VERSION['author']}")
     print(f"BLE device: {BLE_DEVICE_NAME}")
     print(f"Sea level pressure(default): {SEA_LEVEL_PRESSURE_HPA} hPa")
     print("Ensure Bluetooth is enabled and/or select a serial port in the GUI.")
